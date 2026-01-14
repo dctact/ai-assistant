@@ -1,5 +1,27 @@
 """
 Tool manager for integrating external MCP tools with the AI assistant
+
+This module manages the lifecycle of HTTP connections to the MCP server
+and provides tool detection and execution capabilities.
+
+Overview:
+- Async context manager for proper resource lifecycle
+- HTTP client management with automatic cleanup
+- Tool pattern detection and execution
+- Graceful error handling with resource cleanup
+
+Key Dependencies:
+- httpx for async HTTP client (MUST be properly closed)
+- MCP server for tool discovery and execution
+
+Resource Management:
+- Use 'async with ToolManager()' for automatic cleanup
+- Client is closed on error during initialization
+- Fallback __del__ warns if cleanup was missed
+
+Recent Changes:
+- 2025-01-14: Added async context manager protocol for proper resource cleanup
+- 2025-01-14: Added cleanup on initialization failure to prevent leaks
 """
 
 import asyncio
@@ -11,13 +33,38 @@ from loguru import logger
 
 
 class ToolManager:
-    """Manages external tool integration for the AI assistant"""
-    
+    """Manages external tool integration for the AI assistant.
+
+    This class implements the async context manager protocol to ensure
+    proper cleanup of HTTP client resources even in error scenarios.
+
+    Usage:
+        # Preferred: Use async context manager for automatic cleanup
+        async with ToolManager() as tool_manager:
+            result = await tool_manager.execute_tool("web_search", query="test")
+
+        # Alternative: Manual lifecycle management
+        tool_manager = ToolManager()
+        try:
+            await tool_manager.initialize()
+            result = await tool_manager.execute_tool("web_search", query="test")
+        finally:
+            await tool_manager.close()
+    """
+
     def __init__(self, mcp_server_url: str = "http://localhost:8000"):
+        """Initialize tool manager.
+
+        Note: HTTP client is created here but must be explicitly closed
+        via close() method or by using the async context manager protocol.
+        """
         self.mcp_server_url = mcp_server_url.rstrip("/")
-        self.client = httpx.AsyncClient()
+        # Create client with timeout to prevent hanging connections
+        self.client: Optional[httpx.AsyncClient] = httpx.AsyncClient(timeout=30.0)
         self.available_tools = []
-        
+        self._initialized = False
+        self._closed = False
+
         # Tool detection patterns
         self.tool_patterns = {
             "web_search": [
@@ -51,13 +98,50 @@ class ToolManager:
             ]
         }
     
+    async def __aenter__(self):
+        """Async context manager entry.
+
+        Automatically initializes the tool manager when entering
+        the async context. If initialization fails, cleanup is
+        automatic via __aexit__.
+        """
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit.
+
+        Ensures HTTP client is always closed, even if an exception
+        occurred during tool operations.
+        """
+        await self.close()
+        # Don't suppress exceptions
+        return False
+
     async def initialize(self):
-        """Initialize the tool manager"""
+        """Initialize the tool manager by loading available tools.
+
+        If initialization fails, the HTTP client is automatically closed
+        to prevent resource leaks. This ensures that even if the MCP server
+        is unreachable, we don't leave hanging connections.
+        """
+        if self._initialized:
+            logger.debug("Tool manager already initialized")
+            return
+
+        if not self.client:
+            self.client = httpx.AsyncClient(timeout=30.0)
+
         try:
             await self._load_available_tools()
+            self._initialized = True
             logger.info(f"Tool manager initialized with {len(self.available_tools)} tools")
         except Exception as e:
+            # Critical: Clean up HTTP client on initialization failure
+            # This prevents resource leaks when MCP server is unreachable
             logger.error(f"Failed to initialize tool manager: {e}")
+            await self.close()
+            raise
     
     async def _load_available_tools(self):
         """Load available tools from MCP server"""
@@ -233,8 +317,36 @@ class ToolManager:
         return enhanced_message, tool_results
     
     async def close(self):
-        """Close the HTTP client"""
-        await self.client.aclose()
+        """Close the HTTP client and free resources.
+
+        This method is idempotent - calling it multiple times is safe.
+        It checks if the client exists and hasn't already been closed
+        before attempting to close it.
+        """
+        if self._closed:
+            return
+
+        if self.client and not self.client.is_closed:
+            await self.client.aclose()
+            logger.debug("HTTP client closed successfully")
+
+        self.client = None
+        self._closed = True
+
+    def __del__(self):
+        """Destructor to warn about unclosed resources.
+
+        This is a fallback safety net. Ideally, resources should be
+        cleaned up explicitly via close() or async context manager.
+
+        We only warn here because __del__ is called during garbage
+        collection, and we can't await async cleanup at that point.
+        """
+        if self.client and not self._closed:
+            logger.warning(
+                "ToolManager not properly closed. Resources may leak. "
+                "Use 'async with ToolManager()' or call close() explicitly."
+            )
 
 
 # Global tool manager instance
