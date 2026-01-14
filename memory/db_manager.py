@@ -2,6 +2,27 @@
 
 Provides SQLite database management with connection pooling, schema creation,
 CRUD operations, FTS5 full-text search, and vector storage capabilities.
+
+Overview:
+- Thread-safe connection pooling for concurrent access
+- Transaction management with automatic rollback on errors
+- Full-text search via SQLite FTS5
+- Vector embedding storage and retrieval
+
+Key Features:
+- Explicit transaction management prevents partial updates
+- Retry logic with exponential backoff for write conflicts
+- Connection pooling for optimal resource usage
+- WAL mode for better concurrent read performance
+
+Transaction Management:
+- Use transaction() context manager for multi-step operations
+- Automatic BEGIN/COMMIT on success
+- Automatic ROLLBACK on error
+- Prevents data corruption from partial updates
+
+Recent Changes:
+- 2025-01-14: Added transaction context manager with retry logic and rollback
 """
 
 import sqlite3
@@ -198,7 +219,113 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge_base(category)")
             
             conn.commit()
-    
+
+    @contextmanager
+    def transaction(self, max_retries: int = 3):
+        """Transaction context manager with automatic rollback and retry logic.
+
+        Provides explicit transaction management for multi-step database operations.
+        Automatically begins a transaction, commits on success, and rolls back on error.
+
+        Features:
+        - Automatic BEGIN/COMMIT/ROLLBACK
+        - Retry logic with exponential backoff for SQLITE_BUSY errors
+        - Thread-safe via connection pool
+        - Prevents partial updates that could corrupt data
+
+        Args:
+            max_retries: Maximum number of retry attempts for busy database (default: 3)
+
+        Usage:
+            with db_manager.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO ...")
+                cursor.execute("UPDATE ...")
+                # Both operations commit together or both roll back on error
+
+        Yields:
+            SQLite connection with active transaction
+
+        Raises:
+            Exception: Re-raises any exception after rollback, allowing caller to handle
+
+        Examples:
+            # Atomic multi-step operation
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+                # Insert message
+                cursor.execute("INSERT INTO messages (...) VALUES (...)")
+                message_id = cursor.lastrowid
+                # Update conversation timestamp
+                cursor.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", ...)
+                # Both succeed or both fail together
+        """
+        import time
+
+        retry_count = 0
+        last_error = None
+
+        while retry_count <= max_retries:
+            conn = self._pool._pool.get()
+            try:
+                # Begin transaction explicitly
+                # IMMEDIATE mode locks database for writes immediately
+                # This prevents SQLITE_BUSY errors during the transaction
+                conn.execute("BEGIN IMMEDIATE")
+
+                yield conn
+
+                # Commit transaction if no exceptions
+                conn.commit()
+                logger.debug("Transaction committed successfully")
+                return
+
+            except sqlite3.OperationalError as e:
+                # Handle database busy/locked errors with retry logic
+                conn.rollback()
+
+                if "database is locked" in str(e).lower() or "busy" in str(e).lower():
+                    retry_count += 1
+                    last_error = e
+
+                    if retry_count <= max_retries:
+                        # Exponential backoff: 0.1s, 0.2s, 0.4s
+                        wait_time = 0.1 * (2 ** (retry_count - 1))
+                        logger.warning(
+                            f"Database busy, retrying ({retry_count}/{max_retries}) "
+                            f"after {wait_time}s: {e}"
+                        )
+                        self._pool._pool.put(conn)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"Transaction failed after {max_retries} retries: {e}")
+                        self._pool._pool.put(conn)
+                        raise
+                else:
+                    # Non-busy operational error - don't retry
+                    logger.error(f"Database operational error: {e}")
+                    self._pool._pool.put(conn)
+                    raise
+
+            except Exception as e:
+                # Rollback on any error to maintain consistency
+                conn.rollback()
+                logger.error(f"Transaction rolled back due to error: {e}")
+                self._pool._pool.put(conn)
+                raise
+            finally:
+                # Ensure connection always returns to pool
+                if conn:
+                    try:
+                        self._pool._pool.put(conn)
+                    except:
+                        pass
+
+        # If we exhausted all retries
+        if last_error:
+            raise last_error
+
     # Conversation CRUD operations
     def create_conversation(self, conversation_id: str, title: Optional[str] = None, 
                           metadata: Optional[Dict[str, Any]] = None) -> int:
@@ -259,16 +386,31 @@ class DatabaseManager:
             return False
     
     def delete_conversation(self, conversation_id: str) -> bool:
-        """Delete a conversation and its messages."""
-        with self._pool.get_connection() as conn:
+        """Delete a conversation and its messages atomically.
+
+        Uses transaction to ensure both messages and conversation are deleted
+        together. If either deletion fails, both are rolled back.
+
+        This prevents:
+        - Orphaned messages without parent conversation
+        - Conversation records without their messages
+        - Partial deletions that corrupt referential integrity
+        """
+        with self.transaction() as conn:
             cursor = conn.cursor()
+
+            # Delete all messages first (child records)
             cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+            messages_deleted = cursor.rowcount
+
+            # Delete conversation (parent record)
             cursor.execute("DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,))
-            conn.commit()
-            deleted = cursor.rowcount > 0
-            if deleted:
-                logger.info(f"Deleted conversation: {conversation_id}")
-            return deleted
+            conversation_deleted = cursor.rowcount > 0
+
+            if conversation_deleted:
+                logger.info(f"Deleted conversation {conversation_id} with {messages_deleted} messages")
+
+            return conversation_deleted
     
     def list_conversations(self, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
         """List conversations with pagination."""
@@ -284,24 +426,37 @@ class DatabaseManager:
     # Message CRUD operations
     def add_message(self, conversation_id: str, role: str, content: str,
                    metadata: Optional[Dict[str, Any]] = None) -> int:
-        """Add a message to a conversation."""
-        with self._pool.get_connection() as conn:
+        """Add a message to a conversation with transactional consistency.
+
+        Uses transaction to ensure message insertion and conversation update
+        happen atomically. If either operation fails, both are rolled back.
+
+        This prevents:
+        - Messages being added without updating conversation timestamp
+        - Partial updates that could leave database in inconsistent state
+        - Race conditions where timestamp update fails silently
+        """
+        with self.transaction() as conn:
             cursor = conn.cursor()
+
+            # Insert message
             cursor.execute("""
                 INSERT INTO messages (conversation_id, role, content, metadata)
                 VALUES (?, ?, ?, ?)
             """, (conversation_id, role, content, json.dumps(metadata or {})))
-            
-            # Update conversation updated_at
+
+            message_id = cursor.lastrowid
+
+            # Update conversation timestamp
+            # This must succeed for the transaction to commit
             cursor.execute("""
-                UPDATE conversations 
-                SET updated_at = CURRENT_TIMESTAMP 
+                UPDATE conversations
+                SET updated_at = CURRENT_TIMESTAMP
                 WHERE conversation_id = ?
             """, (conversation_id,))
-            
-            conn.commit()
-            logger.debug(f"Added message to conversation {conversation_id}")
-            return cursor.lastrowid
+
+            logger.debug(f"Added message {message_id} to conversation {conversation_id}")
+            return message_id
     
     def get_messages(self, conversation_id: str, limit: Optional[int] = None,
                     offset: int = 0) -> List[Dict[str, Any]]:
