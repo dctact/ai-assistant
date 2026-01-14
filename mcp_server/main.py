@@ -35,7 +35,7 @@ from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer
@@ -599,17 +599,83 @@ async def create_project(
 
 # WebSocket endpoint
 @app.websocket("/ws/{connection_id}")
-async def websocket_endpoint(websocket: WebSocket, connection_id: str):
-    """WebSocket endpoint for real-time interactions"""
-    user_id = "anonymous"  # You'd typically authenticate the WebSocket connection
-    
+async def websocket_endpoint(websocket: WebSocket, connection_id: str, token: str = Query(...)):
+    """WebSocket endpoint for real-time interactions with authentication.
+
+    Security: Requires a valid JWT token to establish WebSocket connection.
+    This prevents unauthorized access to real-time streaming features.
+
+    Args:
+        websocket: WebSocket connection object
+        connection_id: Unique connection identifier
+        token: JWT authentication token (required query parameter)
+
+    Token validation:
+    - Verified before accepting WebSocket connection
+    - Checked periodically during long-running connections
+    - Connection closed if token expires or becomes invalid
+
+    Connection flow:
+    1. Validate JWT token
+    2. Check user permissions
+    3. Accept WebSocket connection
+    4. Associate connection with user
+    5. Process messages with user context
+    6. Periodically revalidate token
+    7. Clean disconnect on token expiry
+    """
+    # Validate authentication token before accepting WebSocket connection
+    # This prevents unauthorized users from establishing connections
+    try:
+        from .auth import auth_manager
+        payload = auth_manager.verify_token(token)
+        user_id = payload.get("sub")
+        permissions = payload.get("permissions", [])
+
+        # Check if user has required permissions for WebSocket access
+        if "read" not in permissions:
+            logger.warning(f"WebSocket connection denied for {user_id}: missing read permission")
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Insufficient permissions")
+            return
+
+        logger.info(f"WebSocket authentication successful for user: {user_id}")
+
+    except HTTPException as e:
+        # Authentication failed - reject connection
+        logger.warning(f"WebSocket authentication failed for connection {connection_id}: {e.detail}")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication failed")
+        return
+
+    # Accept connection only after successful authentication
     await connection_manager.connect(websocket, connection_id, user_id)
-    
+
+    # Track messages for periodic token revalidation
+    # This prevents token expiry during long-running WebSocket sessions
+    message_count = 0
+    TOKEN_REVALIDATION_INTERVAL = 10  # Revalidate every 10 messages
+
     try:
         while True:
             # Receive message from client
             data = await websocket.receive_text()
-            
+
+            # Periodically revalidate token during long connections
+            # This ensures expired tokens don't remain connected
+            message_count += 1
+            if message_count % TOKEN_REVALIDATION_INTERVAL == 0:
+                try:
+                    auth_manager.verify_token(token)
+                    logger.debug(f"Token revalidation successful for user {user_id} (message {message_count})")
+                except HTTPException:
+                    # Token expired or invalid - close connection gracefully
+                    logger.warning(f"Token expired for user {user_id}, closing WebSocket")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Token expired. Please reconnect with a valid token.",
+                        "code": "TOKEN_EXPIRED"
+                    }))
+                    break
+
             try:
                 message = json.loads(data)
                 message_obj = WebSocketMessage(**message)

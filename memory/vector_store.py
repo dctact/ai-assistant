@@ -18,6 +18,7 @@ Optional Features:
 - cluster_entities: Requires scikit-learn, gracefully degrades if not available
 
 Recent Changes:
+- 2025-01-14: Implemented proper LRU cache with thread-safety and performance metrics
 - 2025-10-27: Added optional scikit-learn import with graceful degradation
 """
 
@@ -27,8 +28,10 @@ from typing import List, Dict, Any, Optional, Tuple, Union, Callable
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
+from cachetools import LRUCache
 
 from .db_manager import DatabaseManager, get_db_manager
 
@@ -64,25 +67,46 @@ class SimilarityResult:
 
 
 class VectorStore:
-    """Manages vector storage and similarity search for the AI Assistant."""
-    
+    """Manages vector storage and similarity search for the AI Assistant.
+
+    Uses LRU (Least Recently Used) caching to optimize frequent embedding lookups.
+    Cache automatically evicts least recently used items when full, keeping the
+    most frequently/recently accessed embeddings in memory for fast retrieval.
+
+    Performance characteristics:
+    - Cache hit: O(1) - immediate return from memory
+    - Cache miss: O(1) cache + O(1) database lookup
+    - LRU eviction: O(1) - constant time regardless of cache size
+    """
+
     def __init__(self, db_manager: Optional[DatabaseManager] = None,
                  embedding_dim: int = 1536,
                  cache_size: int = 1000):
-        """Initialize the vector store.
-        
+        """Initialize the vector store with LRU caching.
+
         Args:
             db_manager: Database manager instance. If None, will use default.
             embedding_dim: Dimension of embedding vectors (default: 1536 for OpenAI).
-            cache_size: Number of embeddings to cache in memory.
+            cache_size: Number of embeddings to cache in memory. Larger values use
+                       more RAM but reduce database queries.
         """
         self.db = db_manager or get_db_manager()
         self.embedding_dim = embedding_dim
         self.cache_size = cache_size
-        self._cache: Dict[str, np.ndarray] = {}
+
+        # LRU cache for embeddings
+        # Thread-safe via Lock since cache operations may occur from multiple threads
+        self._cache: LRUCache = LRUCache(maxsize=cache_size)
+        self._cache_lock = Lock()
+
+        # Cache performance metrics
+        # These help monitor cache effectiveness and tune cache_size
+        self._cache_hits = 0
+        self._cache_misses = 0
+
         self._embedding_functions: Dict[str, Callable] = {}
-        
-        logger.info(f"Vector store initialized with dimension {embedding_dim}")
+
+        logger.info(f"Vector store initialized with dimension {embedding_dim}, LRU cache size {cache_size}")
     
     def register_embedding_function(self, entity_type: EntityType, 
                                   func: Callable[[Dict[str, Any]], List[float]]) -> None:
@@ -128,37 +152,48 @@ class VectorStore:
         return embedding_id
     
     def get_embedding(self, entity_type: EntityType, entity_id: int) -> Optional[np.ndarray]:
-        """Get embedding for an entity.
-        
+        """Get embedding for an entity with LRU caching.
+
+        Checks cache first for O(1) lookup. On cache miss, fetches from database
+        and updates cache. The LRU cache automatically evicts least recently used
+        items when full.
+
         Args:
             entity_type: Type of entity.
             entity_id: ID of the entity.
-            
+
         Returns:
             Embedding vector as numpy array, or None if not found.
         """
-        # Check cache first
         cache_key = f"{entity_type.value}_{entity_id}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        # Get from database
+
+        # Check cache first (thread-safe)
+        with self._cache_lock:
+            if cache_key in self._cache:
+                self._cache_hits += 1
+                # LRUCache automatically updates access order on retrieval
+                return self._cache[cache_key]
+
+        # Cache miss - fetch from database
+        self._cache_misses += 1
         result = self.db.get_embedding(entity_type.value, entity_id)
         if result:
             embedding = np.array(result['embedding'])
             self._update_cache(cache_key, embedding)
             return embedding
-        
+
         return None
-    
+
     def _update_cache(self, key: str, embedding: np.ndarray) -> None:
-        """Update the embedding cache with LRU eviction."""
-        if len(self._cache) >= self.cache_size:
-            # Remove oldest entry (simple FIFO for now)
-            oldest_key = next(iter(self._cache))
-            del self._cache[oldest_key]
-        
-        self._cache[key] = embedding
+        """Update the LRU cache with thread-safe operations.
+
+        LRUCache automatically handles eviction when full:
+        - When cache is at max capacity, adding a new item evicts the LRU item
+        - LRU tracking is automatic - no manual bookkeeping needed
+        - O(1) time complexity for both insertion and eviction
+        """
+        with self._cache_lock:
+            self._cache[key] = embedding
     
     def compute_similarity(self, vec1: np.ndarray, vec2: np.ndarray,
                          method: str = "cosine") -> float:
@@ -760,14 +795,54 @@ class VectorStore:
                 raise ValueError(f"Import failed at entry: {e}") from e
 
         return imported
-    
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache performance statistics.
+
+        Returns detailed metrics about cache performance including:
+        - Hit/miss counts and ratio
+        - Current cache utilization
+        - Performance indicators
+
+        Use these metrics to:
+        - Monitor cache effectiveness (target >80% hit rate)
+        - Tune cache_size parameter
+        - Identify performance bottlenecks
+
+        Returns:
+            Dictionary with cache statistics:
+            - hits: Number of cache hits
+            - misses: Number of cache misses
+            - hit_rate: Percentage of requests served from cache (0.0-1.0)
+            - size: Current number of items in cache
+            - max_size: Maximum cache capacity
+            - utilization: Percentage of cache capacity used (0.0-1.0)
+        """
+        with self._cache_lock:
+            total_requests = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
+            current_size = len(self._cache)
+            utilization = current_size / self.cache_size if self.cache_size > 0 else 0.0
+
+            return {
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "hit_rate": hit_rate,
+                "size": current_size,
+                "max_size": self.cache_size,
+                "utilization": utilization
+            }
+
     def get_statistics(self) -> Dict[str, Any]:
-        """Get statistics about stored embeddings."""
+        """Get comprehensive statistics about stored embeddings and cache performance."""
+        # Get cache stats first
+        cache_stats = self.get_cache_stats()
+
         stats = {
             'total_embeddings': 0,
             'by_entity_type': {},
             'by_model': {},
-            'cache_size': len(self._cache),
+            'cache': cache_stats,  # Include cache performance metrics
             'embedding_dimension': self.embedding_dim
         }
         
